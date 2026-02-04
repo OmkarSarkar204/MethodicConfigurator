@@ -51,7 +51,7 @@ from ardupilot_methodic_configurator.frontend_tkinter_flightcontroller_connectio
 from ardupilot_methodic_configurator.frontend_tkinter_flightcontroller_info import FlightControllerInfoWindow
 from ardupilot_methodic_configurator.frontend_tkinter_parameter_editor import ParameterEditorWindow
 from ardupilot_methodic_configurator.frontend_tkinter_project_opener import VehicleProjectOpenerWindow
-from ardupilot_methodic_configurator.frontend_tkinter_show import show_confirmation_dialog, show_error_message
+from ardupilot_methodic_configurator.frontend_tkinter_show import show_error_message
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_window import PopupWindow
 from ardupilot_methodic_configurator.frontend_tkinter_usage_popup_windows import display_workflow_explanation
 from ardupilot_methodic_configurator.plugin_constants import PLUGIN_MOTOR_TEST
@@ -492,7 +492,14 @@ def process_component_editor_results(
     """
     Process the results after component editor completion.
 
-    Handles the two-phase commit for derived parameters.
+    Args:
+        flight_controller: Flight controller instance
+        local_filesystem: Local filesystem instance
+        vehicle_project_manager: Vehicle directory selection window if any
+
+    Raises:
+        SystemExit: If there's an error in derived parameters
+
     """
     # Determine parameter source
     source_param_values: Union[dict[str, float], None] = None
@@ -506,51 +513,14 @@ def process_component_editor_results(
     elif local_filesystem.param_default_dict:
         existing_fc_params = list(local_filesystem.param_default_dict.keys())
 
-    # --- PHASE 1: CHECK FOR CHANGES ---
-    # Try to update without committing. Backend will return a Dict if changes are needed.
-    result = local_filesystem.update_and_export_vehicle_params_from_fc(
-        source_param_values=source_param_values,
-        existing_fc_params=existing_fc_params,
-        commit_derived_changes=False,
+    # Update and export vehicle parameters
+    error_message = local_filesystem.update_and_export_vehicle_params_from_fc(
+        source_param_values=source_param_values, existing_fc_params=existing_fc_params
     )
 
-    # --- PHASE 2: UI DECISION ---
-    if isinstance(result, dict):
-        # We have pending changes!
-        # Fix: iterate over dict directly, removed .keys() to satisfy SIM118
-        file_list = "\n".join([f"• {fname}" for fname in result])
-
-        message = _(
-            "The configuration has been updated based on your component selection.\n"
-            "The following files need to be updated with calculated values:\n\n"
-            "{file_list}\n\n"
-            "Do you want to save these changes to disk?"
-        ).format(file_list=file_list)
-
-        if show_confirmation_dialog(_("Confirm Derived Parameters"), message):
-            # User said YES -> Commit
-            result_obj = local_filesystem.update_and_export_vehicle_params_from_fc(
-                source_param_values=source_param_values,
-                existing_fc_params=existing_fc_params,
-                commit_derived_changes=True,
-            )
-
-            if result_obj:
-                error_text: str = str(result_obj)
-                logging_error(error_text)
-                show_error_message(_("Error saving parameters"), error_text)
-                sys_exit(1)
-        else:
-            # User said NO -> Discard changes
-            logging_info(_("User discarded derived parameter changes."))
-
-            # NUCLEAR REVERT: Force reload from disk to wipe dirty memory
-            if vehicle_project_manager:
-                local_filesystem.file_parameters = local_filesystem.read_params_from_files()
-
-    elif isinstance(result, str) and result:
-        logging_error(result)
-        show_error_message(_("Error in derived parameters"), str(result))
+    if error_message:
+        logging_error(error_message)
+        show_error_message(_("Error in derived parameters"), error_message)
         sys_exit(1)
 
 
