@@ -785,49 +785,89 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
         return variables
 
     def update_and_export_vehicle_params_from_fc(
-        self, source_param_values: Union[dict[str, float], None], existing_fc_params: list[str]
-    ) -> str:
+        self,
+        source_param_values: Union[dict[str, float], None],
+        existing_fc_params: list[str],
+        commit_derived_changes: bool = False,
+    ) -> Union[str, dict]:
         """
-        Update parameter values from flight controller data and export to vehicle files.
+        Updates parameters from FC and computes derived values.
 
-        This function performs several operations in sequence:
-        1. Updates parameter values using the provided source values
-        2. Computes forced parameters based on configuration steps
-        3. Computes derived parameters that depend on other parameters
-        4. Exports the updated parameters to files in the vehicle directory
-
-        Args:
-            source_param_values: Dictionary mapping parameter names to their values from the
-                                source (typically flight controller). If None, no direct updates occur.
-            existing_fc_params: List of params that exist in the FC if empty or None all parameters are
-                                assumed to exist
-
-        Returns:
-            str: Empty string if successful, error message otherwise.
-
+        FIXED: Now correctly merges derived values before saving.
         """
+        # pylint: disable=too-many-locals, too-many-branches
         eval_variables = self.get_eval_variables()
-        # the eval variables do not contain fc_parameter values
-        # and that is intentional, the fc_parameters are not to be used in here
+        all_pending_changes = {}
+
         for param_filename, param_dict in self.file_parameters.items():
+            # 0. DISK SNAPSHOT
+            try:
+                disk_path = os_path.join(self.vehicle_dir, param_filename)
+                if os_path.exists(disk_path):
+                    disk_params = ParDict.from_file(disk_path)
+                    original_snapshot = {name: par.value for name, par in disk_params.items()}
+                else:
+                    original_snapshot = {}
+            except Exception:  # pylint: disable=broad-exception-caught
+                original_snapshot = {name: par.value for name, par in param_dict.items()}
+
+            # 1. Update from FC / Source
             for param_name, param in param_dict.items():
                 if source_param_values and param_name in source_param_values:
                     param.value = source_param_values[param_name]
+
             if self.configuration_steps and param_filename in self.configuration_steps:
                 step_dict = self.configuration_steps[param_filename]
+
+                # 2. Compute FORCED parameters
                 error_msg = self.compute_parameters(param_filename, step_dict, "forced", eval_variables)
                 if error_msg:
                     return error_msg
                 self.merge_forced_or_derived_parameters(param_filename, self.forced_parameters, existing_fc_params)
+
+                # 3. Compute DERIVED parameters
                 error_msg = self.compute_parameters(
                     param_filename, step_dict, "derived", eval_variables, ignore_fc_derived_param_warnings=True
                 )
                 if error_msg:
                     return error_msg
-                self.merge_forced_or_derived_parameters(param_filename, self.derived_parameters, existing_fc_params)
+
+                # 4. CAPTURE CHANGES (Compare vs Disk Snapshot)
+                file_has_changes = False
+
+                if param_filename in self.derived_parameters:
+                    for param_name, new_par in self.derived_parameters[param_filename].items():
+                        original_val = original_snapshot.get(param_name)
+                        if original_val is not None and abs(original_val - new_par.value) > 0.000001:
+                            file_has_changes = True
+                            break
+
+                if not file_has_changes and param_filename in self.forced_parameters:
+                    for param_name, new_par in self.forced_parameters[param_filename].items():
+                        original_val = original_snapshot.get(param_name)
+                        if original_val is not None and abs(original_val - new_par.value) > 0.000001:
+                            file_has_changes = True
+                            break
+
+                if file_has_changes:
+                    all_pending_changes[param_filename] = True
+
+            # 5. THE GATEKEEPER
+            if all_pending_changes.get(param_filename) and not commit_derived_changes:
+                continue
+
+            # 5.5. APPLY CHANGES
+            self.merge_forced_or_derived_parameters(param_filename, self.derived_parameters, existing_fc_params)
+
+            # 6. Save to disk
             self.export_to_param(
                 param_dict, param_filename, annotate_doc=bool(ProgramSettings.get_setting("annotate_docs_into_param_files"))
             )
+
+        # 7. RETURN STAGED DATA
+        if all_pending_changes and not commit_derived_changes:
+            return all_pending_changes
+
         return ""
 
     def merge_forced_or_derived_parameters(

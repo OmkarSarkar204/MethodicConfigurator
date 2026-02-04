@@ -589,3 +589,14 @@ def show_tooltip(widget: tk.Widget, text: str, position_below: bool = True) -> T
 
 def show_tooltip_on_richtext_tag(widget: tk.Text, text: str, tag_name: str, position_below: bool = True) -> Tooltip:
     return Tooltip(widget, text, position_below=position_below, tag_name=tag_name)
+
+
+def show_confirmation_dialog(title: str, message: str) -> bool:
+    """
+    Display a confirmation dialog with Yes/No buttons.
+
+    :param title: The title of the dialog window.
+    :param message: The message body to display.
+    :return: True if the user clicked 'Yes', False otherwise.
+    """
+    return messagebox.askyesno(title, message)
