@@ -15,9 +15,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter
+from ardupilot_methodic_configurator.data_model_ardupilot_parameter import ArduPilotParameter, ParameterOutOfRangeError
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
-from ardupilot_methodic_configurator.data_model_parameter_editor import ParameterEditor, ParameterValueUpdateStatus
+from ardupilot_methodic_configurator.data_model_parameter_editor import (
+    InvalidParameterNameError,
+    OperationNotPossibleError,
+    ParameterEditor,
+    ParameterValueUpdateStatus,
+)
 from ardupilot_methodic_configurator.plugin_constants import PLUGIN_BATTERY_MONITOR, PLUGIN_MOTOR_TEST
 
 # pylint: disable=redefined-outer-name, too-many-lines, protected-access
@@ -3720,3 +3725,254 @@ class TestParameterUploadNavigation:
         # Assert: No reset and not uploaded
         assert reset_required is False
         assert "FMT" not in uploaded_params
+
+
+class TestParameterManagementBehavior:
+    """Test user interactions when editing, adding, or removing parameters."""
+
+    def test_add_parameter_raises_when_already_in_file(self, parameter_editor) -> None:
+        """
+        User receives an error when adding a parameter that already exists in the file.
+
+        GIVEN: A parameter file containing P1
+        WHEN: The user attempts to add P1 again
+        THEN: InvalidParameterNameError is raised
+        """
+        # Arrange
+        parameter_editor.current_file = "f.param"
+        parameter_editor._local_filesystem.file_parameters = {"f.param": ParDict({"P1": Par(1.0)})}
+        parameter_editor._deleted_parameters = set()
+
+        # Assert
+        with pytest.raises(InvalidParameterNameError):
+            parameter_editor.add_parameter_to_current_file("P1")
+
+    def test_add_parameter_raises_when_already_added_this_session(self, parameter_editor) -> None:
+        """
+        User receives an error when adding a parameter that was already added this session.
+
+        GIVEN: A parameter P2 that was added earlier in the same session
+        WHEN: The user attempts to add P2 again
+        THEN: InvalidParameterNameError is raised
+        """
+        # Arrange
+        parameter_editor.current_file = "f.param"
+        parameter_editor._local_filesystem.file_parameters = {"f.param": ParDict()}
+        parameter_editor._added_parameters = {"P2"}
+
+        # Assert
+        with pytest.raises(InvalidParameterNameError):
+            parameter_editor.add_parameter_to_current_file("P2")
+
+    def test_add_parameter_raises_when_no_fc_and_no_docs(self, parameter_editor) -> None:
+        """
+        User receives an error when no FC is connected and no documentation exists.
+
+        GIVEN: No flight controller connected and no apm.pdef.xml documentation
+        WHEN: The user attempts to add an unknown parameter
+        THEN: OperationNotPossibleError is raised
+        """
+        # Arrange
+        parameter_editor.current_file = "f.param"
+        parameter_editor._local_filesystem.file_parameters = {"f.param": ParDict()}
+        parameter_editor._added_parameters = set()
+        parameter_editor._deleted_parameters = set()
+        parameter_editor._flight_controller.master = None
+        parameter_editor._flight_controller.fc_parameters = {}
+        parameter_editor._local_filesystem.doc_dict = {}
+
+        # Assert
+        with pytest.raises(OperationNotPossibleError):
+            parameter_editor.add_parameter_to_current_file("UNKNOWN")
+
+    def test_system_falls_back_to_fc_parameters_when_docs_missing(self, parameter_editor) -> None:
+        """
+        System populates available parameter list using FC data if documentation is missing.
+
+        GIVEN: A system with an active FC but missing XML documentation
+        WHEN: The user opens the Add Parameter dialog
+        THEN: It should populate the list using the live FC parameters
+        """
+        # Arrange
+        parameter_editor._local_filesystem.doc_dict = {}
+        parameter_editor._flight_controller.fc_parameters = {"P1": 1.0, "P2": 2.0}
+        parameter_editor._flight_controller.master = MagicMock()
+        parameter_editor.current_step_parameters = {}
+
+        # Act
+        result = parameter_editor.get_possible_add_param_names()
+
+        # Assert
+        assert "P1" in result
+        assert "P2" in result
+
+    def test_add_parameters_skips_when_add_returns_false(self, parameter_editor) -> None:
+        """
+        System places a parameter in the skipped list when add_parameter_to_current_file returns False.
+
+        GIVEN: A parameter whose individual add returns False
+        WHEN: The user bulk-adds parameters
+        THEN: The parameter appears in the skipped list
+        """
+        with patch.object(parameter_editor, "add_parameter_to_current_file", return_value=False):
+            _, skipped, _ = parameter_editor.add_parameters_to_current_file(["P1"])
+
+        # Assert
+        assert "P1" in skipped
+
+    def test_bulk_feedback_returns_info_when_only_skipped(self) -> None:
+        """
+        System returns an info-level message when all parameters were only skipped.
+
+        GIVEN: A bulk add where no parameters succeeded or failed, only skipped
+        WHEN: The feedback message is generated
+        THEN: The message level is info
+        """
+        # Act
+        msg_type, _, _ = ParameterEditor.generate_bulk_add_feedback_message([], ["S"], [])
+
+        # Assert
+        assert msg_type == "info"
+
+    def test_bulk_feedback_returns_error_when_failures_present(self) -> None:
+        """
+        System returns an error-level message when failures are present with no additions.
+
+        GIVEN: A bulk add where some failed and some were skipped but none succeeded
+        WHEN: The feedback message is generated
+        THEN: The message level is error
+        """
+        # Act
+        msg_type, _, _ = ParameterEditor.generate_bulk_add_feedback_message([], ["S"], ["F"])
+
+        # Assert
+        assert msg_type == "error"
+
+    def test_bulk_feedback_returns_warning_on_partial_success(self) -> None:
+        """
+        System returns a warning-level message on partial success with some skipped.
+
+        GIVEN: A bulk add where some parameters were added and some were skipped
+        WHEN: The feedback message is generated
+        THEN: The message level is warning
+        """
+        # Act
+        msg_type, _, _ = ParameterEditor.generate_bulk_add_feedback_message(["A"], ["S"], [])
+
+        # Assert
+        assert msg_type == "warning"
+
+    def test_system_tracks_renamed_parameters_during_repopulation(self, parameter_editor) -> None:
+        """
+        System marks old parameter names as deleted and new names as added during rename.
+
+        GIVEN: A configuration step that renames OLD to NEW
+        WHEN: The step is repopulated
+        THEN: OLD is in deleted parameters and NEW is in added parameters
+        """
+        # Arrange
+        parameter_editor.current_file = "test.param"
+        parameter_editor._local_filesystem.file_parameters = {"test.param": ParDict({"OLD": Par(1.0)})}
+        mock_new = MagicMock()
+
+        # Act
+        with (
+            patch.object(
+                parameter_editor._config_step_processor,
+                "process_configuration_step",
+                return_value=({"OLD": MagicMock()}, [], [], [], [("OLD", "NEW")], ParDict()),
+            ),
+            patch.object(parameter_editor._config_step_processor, "create_ardupilot_parameter", return_value=mock_new),
+        ):
+            parameter_editor._repopulate_configuration_step_parameters()
+
+        # Assert
+        assert "OLD" in parameter_editor._deleted_parameters
+        assert "NEW" in parameter_editor._added_parameters
+
+    def test_system_applies_derived_parameter_comment_during_repopulation(self, parameter_editor) -> None:
+        """
+        System applies the derivation reason to a parameter when it is auto-derived.
+
+        GIVEN: A configuration step that derives DER with a reason string
+        WHEN: The step is repopulated
+        THEN: set_forced_or_derived_change_reason is called with the reason
+        """
+        # Arrange
+        parameter_editor.current_file = "test.param"
+        parameter_editor._local_filesystem.file_parameters = {"test.param": ParDict()}
+        mock_der = MagicMock()
+
+        # Act
+        with patch.object(
+            parameter_editor._config_step_processor,
+            "process_configuration_step",
+            return_value=({"DER": mock_der}, [], [], [], [], ParDict({"DER": Par(2.0, "reason")})),
+        ):
+            parameter_editor._repopulate_configuration_step_parameters()
+
+        # Assert
+        mock_der.set_forced_or_derived_change_reason.assert_called_with("reason")
+
+    def test_system_flags_out_of_range_value_with_error_status(self, parameter_editor) -> None:
+        """
+        System returns ERROR status when a parameter value exceeds its valid range.
+
+        GIVEN: A parameter whose set_new_value raises ParameterOutOfRangeError
+        WHEN: The user updates the value with range check disabled
+        THEN: The result status is ERROR
+        """
+        # Arrange
+        mock_param = MagicMock()
+        mock_param.set_new_value.side_effect = ParameterOutOfRangeError("err")
+        parameter_editor.current_step_parameters = {"P1": mock_param}
+
+        # Act
+        result = parameter_editor.update_parameter_value("P1", "999", include_range_check=False)
+
+        # Assert
+        assert result.status == ParameterValueUpdateStatus.ERROR
+
+    def test_get_different_parameters_delegates_to_processor(self, parameter_editor) -> None:
+        """
+        System delegates the different-parameters query to the config step processor.
+
+        GIVEN: A set of current step parameters
+        WHEN: get_different_parameters is called
+        THEN: The result comes from filter_different_parameters on the processor
+        """
+        # Arrange
+        mock_param = MagicMock()
+        parameter_editor.current_step_parameters = {"P1": mock_param}
+
+        with patch.object(
+            parameter_editor._config_step_processor,
+            "filter_different_parameters",
+            return_value={"P1": mock_param},
+        ):
+            assert parameter_editor.get_different_parameters() == {"P1": mock_param}
+
+    def test_generate_parameter_summary_returns_empty_when_no_fc_params(self, parameter_editor) -> None:
+        """
+        System returns an empty dict when no annotated FC parameters are available.
+
+        GIVEN: An annotate call that returns an empty dict
+        WHEN: _generate_parameter_summary is called
+        THEN: An empty dict is returned
+        """
+        parameter_editor._local_filesystem.annotate_intermediate_comments_to_param_dict.return_value = {}
+
+        assert parameter_editor._generate_parameter_summary() == {}
+
+    def test_parse_mandatory_level_returns_zero_for_out_of_range_percentage(self, parameter_editor) -> None:
+        """
+        System returns zero for mandatory level when the percentage value exceeds 100.
+
+        GIVEN: A mandatory text starting with a value greater than 100
+        WHEN: parse_mandatory_level_percentage is called
+        THEN: The percentage returned is 0
+        """
+        # Act
+        level, _ = parameter_editor.parse_mandatory_level_percentage("999% something")
+
+        assert level == 0
