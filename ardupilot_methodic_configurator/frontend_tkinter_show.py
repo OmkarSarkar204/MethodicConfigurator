@@ -10,6 +10,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # https://wiki.tcl-lang.org/page/Changing+Widget+Colors
 
+import contextlib
 import tkinter as tk
 from platform import system as platform_system
 from tkinter import messagebox, ttk
@@ -508,7 +509,8 @@ class Tooltip:
     def _cancel_show(self) -> None:
         """Cancel any pending show timer."""
         if self.show_timer:
-            self.widget.after_cancel(self.show_timer)
+            with contextlib.suppress(tk.TclError):
+                self.widget.after_cancel(self.show_timer)
             self.show_timer = None
 
     def show(self, event: Optional[tk.Event] = None) -> None:  # noqa: ARG002 # pylint: disable=unused-argument
@@ -523,13 +525,16 @@ class Tooltip:
     def _cancel_hide(self, event: Optional[tk.Event] = None) -> None:  # noqa: ARG002 # pylint: disable=unused-argument
         """Cancel the hide timer."""
         if self.hide_timer:
-            self.widget.after_cancel(self.hide_timer)
+            with contextlib.suppress(tk.TclError):
+                self.widget.after_cancel(self.hide_timer)
             self.hide_timer = None
 
     def _hide_active_tooltip(self) -> None:
         """Hide another active tooltip before showing this one."""
         if Tooltip._active_tooltip and Tooltip._active_tooltip is not self:
-            Tooltip._active_tooltip.force_hide()
+            with contextlib.suppress(tk.TclError):
+                Tooltip._active_tooltip.force_hide()
+            Tooltip._active_tooltip = None
 
     def schedule_show(self, event: Optional[tk.Event] = None) -> None:  # noqa: ARG002 # pylint: disable=unused-argument
         """Delay tooltip creation slightly to avoid flicker during pointer movement."""
@@ -568,6 +573,13 @@ class Tooltip:
         )
         tooltip_label.pack()
         self.position_tooltip()
+
+        if platform_system() == "Darwin":
+            # Aggressively force macOS to paint the pixels before showing
+            self.tooltip.update()
+        else:
+            self.tooltip.update_idletasks()
+
         self.tooltip.deiconify()
         Tooltip._active_tooltip = self
 
@@ -577,6 +589,11 @@ class Tooltip:
             return
 
         try:
+            # Force the parent window to update scroll/move positions
+            # so winfo_rootx/y are accurate
+            self.widget.winfo_toplevel().update_idletasks()
+
+            self.tooltip.update_idletasks()
             # Ensure tooltip geometry is calculated
             self.tooltip.update_idletasks()
             tooltip_width = self.tooltip.winfo_reqwidth()
