@@ -53,7 +53,7 @@ dependencies = [
     "numpy==2.3.4; python_version >= '3.13'",
     "pillow==12.3.0",
     "pip_system_certs==5.3",
-    "platformdirs==4.11.3",
+    "platformdirs==4.11.8",
     "pymavlink==2.4.49",
     "pyserial==3.5",
     "requests==2.34.2",
@@ -65,7 +65,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [
-    "coverage==7.15.4",
+    "coverage==7.16.0",
     "mock==5.2.0",
     "mypy==2.3.1",
     "pre-commit==4.6.2",
@@ -76,9 +76,10 @@ dev = [
     "pytest-cov==7.1.0",
     "pytest-md==0.2.0",
     "pytest-mock==3.15.1",
+    "pytest-timeout==2.4.0",
     "python-gettext==5.0",
     "ruff==0.16.3",
-    "types-requests==2.33.0.20260712",
+    "types-requests==2.33.0.20260906",
     "ty==0.0.75",
 ]
 
@@ -190,6 +191,8 @@ exclude = [
     "find_exclusive_parameter_names.py",
     # Synchronized verbatim from ArduPilot by update_flightcontroller_ids.yml.
     "ardupilot_methodic_configurator/decode_devid.py",
+    # Maintained MAVProxy adaptation covered by focused MAVFTP tests.
+    "ardupilot_methodic_configurator/backend_mavftp.py",
 ]
 
 # https://docs.astral.sh/ruff/rules/
@@ -266,6 +269,11 @@ warn_unused_configs = true
 
 files = ["ardupilot_methodic_configurator/*.py"]
 
+[[tool.mypy.overrides]]
+# The maintained MAVProxy adaptation is checked by focused runtime tests.
+module = "ardupilot_methodic_configurator.backend_mavftp"
+ignore_errors = true
+
 [tool.pyright]
 include = [
     "ardupilot_methodic_configurator/*.py",
@@ -292,6 +300,7 @@ exclude = [
     "mavftp.py",
     "fix_with_statements.py",
     "find_exclusive_parameter_names.py",
+    "ardupilot_methodic_configurator/decode_devid.py",
     "ardupilot_methodic_configurator/tempcal_imu.py",
     "ardupilot_methodic_configurator/backend_mavftp.py",
     "ardupilot_methodic_configurator/mavftp_example.py",

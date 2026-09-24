@@ -11,6 +11,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # from sys import exit as sys_exit
 from argparse import ArgumentParser
+from copy import deepcopy
 from logging import debug as logging_debug
 from logging import error as logging_error
 from logging import exception as logging_exception
@@ -56,7 +57,12 @@ PARAMETER_FILE_REGEXP = r"^\d{2}_.*\.param$"
 TOOLTIP_MAX_LENGTH = 105
 
 
-class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  # pylint: disable=too-many-public-methods
+def _firmware_versions_match(left: str, right: str) -> bool:
+    """Compare every dot-separated firmware component, including the patch version."""
+    return tuple(left.split(".")) == tuple(right.split("."))
+
+
+class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  # pylint: disable=too-many-public-methods, too-many-instance-attributes
     """
     A class to manage local filesystem operations for the ArduPilot methodic configurator.
 
@@ -84,11 +90,14 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
         ProgramSettings.__init__(self)
         self.vehicle_type = vehicle_type
         self.fw_version = fw_version
+        self._fw_version_is_explicit = bool(fw_version)
         self.allow_editing_template_files = allow_editing_template_files
         self.param_default_dict: ParDict = ParDict()
         self.vehicle_dir = vehicle_dir
         self.doc_dict: dict[str, Any] = {}
+        self._parameter_metadata_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         if vehicle_dir is not None:
+            self.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
             self.re_init(vehicle_dir, vehicle_type)
 
     def re_init(self, vehicle_dir: str, vehicle_type: str, blank_component_data: bool = False) -> None:
@@ -103,7 +112,7 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
             if self.vehicle_components_fs.data and "Components" in self.vehicle_components_fs.data:
                 self.save_vehicle_components_json_data(self.vehicle_components_fs.data, self.vehicle_dir)
 
-        if not self.fw_version:
+        if not self._fw_version_is_explicit:
             self.fw_version = self.get_fc_fw_version_from_vehicle_components_json()
 
         if vehicle_type == "":
@@ -125,12 +134,15 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
 
         fw_version = re_compile(r"[ _-]").split(self.fw_version, 1)[0]
         # Read ArduPilot parameter documentation
-        xml_url = get_xml_url(vehicle_type, fw_version)
-        fallback_xml_url = get_fallback_xml_url(vehicle_type, fw_version)
         xml_dir = get_xml_dir(vehicle_dir)
-        self.doc_dict = parse_parameter_metadata(
-            xml_url, xml_dir, PARAM_DEFINITION_XML_FILE, vehicle_type, TOOLTIP_MAX_LENGTH, fallback_xml_url
-        )
+        metadata_cache_key = (vehicle_type, fw_version, xml_dir)
+        if metadata_cache_key not in self._parameter_metadata_cache:
+            xml_url = get_xml_url(vehicle_type, fw_version)
+            fallback_xml_url = get_fallback_xml_url(vehicle_type, fw_version)
+            self._parameter_metadata_cache[metadata_cache_key] = parse_parameter_metadata(
+                xml_url, xml_dir, PARAM_DEFINITION_XML_FILE, vehicle_type, TOOLTIP_MAX_LENGTH, fallback_xml_url
+            )
+        self.doc_dict = deepcopy(self._parameter_metadata_cache[metadata_cache_key])
         self.param_default_dict = load_default_param_file(vehicle_dir)
 
         # Extend parameter documentation metadata if <parameter_file>.pdef.xml exists
@@ -141,6 +153,46 @@ class LocalFilesystem(VehicleComponents, ConfigurationSteps, ProgramSettings):  
                 self.doc_dict.update(doc_dict)
 
         self.__extend_and_reformat_parameter_documentation_metadata()
+
+    def remove_cached_parameter_metadata_for_mismatched_firmware(self, vehicle_dir: str) -> bool:
+        """
+        Remove cached parameter metadata when a project was made for another FC firmware.
+
+        ``fw_version`` is explicit only when it came from a connected flight controller.
+        In that case, a project's cached ``apm.pdef.xml`` may belong to the firmware
+        recorded in its vehicle_components.json instead.  Remove both the on-disk and
+        in-memory copies so the following reinitialization downloads matching metadata.
+        """
+        if not self._fw_version_is_explicit:
+            return False
+
+        fc_fw_version = re_compile(r"[ _-]").split(self.fw_version, 1)[0]
+        if not fc_fw_version or not self.load_vehicle_components_json_data(vehicle_dir):
+            return False
+
+        project_fw_version = self.get_fc_fw_version_from_vehicle_components_json()
+        if not project_fw_version or _firmware_versions_match(project_fw_version, fc_fw_version):
+            return False
+
+        project_vehicle_type = self.get_fc_fw_type_from_vehicle_components_json()
+        cache_key = (project_vehicle_type, fc_fw_version, get_xml_dir(vehicle_dir))
+        removed_from_memory = self._parameter_metadata_cache.pop(cache_key, None) is not None
+
+        metadata_file = os_path.join(vehicle_dir, PARAM_DEFINITION_XML_FILE)
+        try:
+            os_remove(metadata_file)
+        except FileNotFoundError:
+            return removed_from_memory
+        except OSError as error:
+            logging_warning(_("Could not remove cached parameter metadata %s: %s"), metadata_file, error)
+            return removed_from_memory
+
+        logging_info(
+            _("Removed cached parameter metadata because project firmware %s differs from connected FC firmware %s."),
+            project_fw_version,
+            fc_fw_version,
+        )
+        return True
 
     def vehicle_configuration_files_exist(self, vehicle_dir: str) -> bool:
         vehicle_path = Path(vehicle_dir)

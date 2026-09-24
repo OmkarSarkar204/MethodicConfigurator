@@ -133,6 +133,7 @@ Notes
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -158,6 +159,85 @@ from ardupilot_methodic_configurator.data_model_vehicle_project_creator import (
 logger = logging.getLogger(__name__)
 
 
+def test_offline_metadata_seed_uses_explicit_template_source(tmp_path: Path) -> None:
+    """Offline metadata seeding must copy from the requested template, not mutable filesystem state."""
+    template_dir = tmp_path / "empty_template"
+    target_dir = tmp_path / "new_vehicle"
+    template_dir.mkdir()
+    target_dir.mkdir()
+    (template_dir / "apm.pdef.xml").write_text(
+        "<!-- Generated from git tag Copter-4.6.3 -->\ntemplate metadata", encoding="utf-8"
+    )
+
+    _seed_offline_parameter_metadata(template_dir, target_dir, "ArduCopter", "4.6.3")
+
+    assert (target_dir / "apm.pdef.xml").read_text(encoding="utf-8") == (
+        "<!-- Generated from git tag Copter-4.6.3 -->\ntemplate metadata"
+    )
+
+
+def test_offline_metadata_seed_does_not_overwrite_existing_metadata(tmp_path: Path) -> None:
+    """Existing project metadata must remain untouched when seeding offline fixtures."""
+    template_dir = tmp_path / "empty_template"
+    target_dir = tmp_path / "new_vehicle"
+    template_dir.mkdir()
+    target_dir.mkdir()
+    (template_dir / "apm.pdef.xml").write_text("template metadata", encoding="utf-8")
+    (target_dir / "apm.pdef.xml").write_text("existing metadata", encoding="utf-8")
+
+    _seed_offline_parameter_metadata(template_dir, target_dir, "ArduCopter", "4.6.3")
+
+    assert (target_dir / "apm.pdef.xml").read_text(encoding="utf-8") == "existing metadata"
+
+
+def test_offline_metadata_seed_rejects_stale_existing_metadata(tmp_path: Path) -> None:
+    """An existing cached definition must still be checked for firmware compatibility."""
+    template_dir = tmp_path / "empty_template"
+    target_dir = tmp_path / "new_vehicle"
+    template_dir.mkdir()
+    target_dir.mkdir()
+    (template_dir / "apm.pdef.xml").write_text("<!-- Generated from git tag Copter-4.6.0 -->", encoding="utf-8")
+    (target_dir / "apm.pdef.xml").write_text("<!-- Generated from git tag Copter-4.5.0 -->", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape("incompatible with ArduCopter 4.6.3")):
+        _seed_offline_parameter_metadata(template_dir, target_dir, "ArduCopter", "4.6.3")
+
+
+def test_offline_metadata_seed_rejects_incompatible_firmware_metadata(tmp_path: Path) -> None:
+    """Offline metadata must not silently come from another ArduPilot patch release."""
+    template_dir = tmp_path / "empty_template"
+    target_dir = tmp_path / "new_vehicle"
+    template_dir.mkdir()
+    target_dir.mkdir()
+    (template_dir / "apm.pdef.xml").write_text("<!-- Generated from git tag Copter-4.6.0 -->\n<paramfile />", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape("incompatible with ArduCopter 4.6.3")):
+        _seed_offline_parameter_metadata(template_dir, target_dir, "ArduCopter", "4.6.3")
+
+
+def _seed_offline_parameter_metadata(
+    metadata_source_dir: Path, new_vehicle_dir: str | Path, vehicle_type: str, firmware_version: str
+) -> None:
+    """Copy cached parameter metadata into a generated project for offline acceptance tests."""
+    metadata_source = metadata_source_dir / "apm.pdef.xml"
+    metadata_target = Path(new_vehicle_dir) / "apm.pdef.xml"
+    metadata_to_validate = metadata_target if metadata_target.exists() else metadata_source
+    if not metadata_to_validate.is_file():
+        raise FileNotFoundError(f"Offline parameter metadata not found: {metadata_to_validate}")
+    metadata_vehicle = {"ArduCopter": "Copter", "ArduPlane": "Plane"}.get(vehicle_type)
+    if metadata_vehicle and firmware_version:
+        metadata_text = metadata_to_validate.read_text(encoding="utf-8")
+        metadata_match = re.search(rf"Generated from git tag {metadata_vehicle}-(\d+\.\d+\.\d+)", metadata_text)
+        expected_release = firmware_version.split(" ", maxsplit=1)[0]
+        if metadata_match and metadata_match.group(1) != expected_release:
+            raise ValueError(
+                f"Offline parameter metadata {metadata_to_validate} is incompatible with {vehicle_type} {firmware_version}"
+            )
+    if metadata_target.exists():
+        return
+    shutil.copy2(metadata_source, metadata_target)
+
+
 def create_test_filesystem(vehicle_dir: Path, vehicle_type: str):
     """
     Create LocalFilesystem and schema for testing.
@@ -173,7 +253,7 @@ def create_test_filesystem(vehicle_dir: Path, vehicle_type: str):
     local_fs = LocalFilesystem(
         vehicle_dir=str(vehicle_dir),
         vehicle_type=vehicle_type,
-        fw_version="4.6.3",
+        fw_version="",
         allow_editing_template_files=True,
         save_component_to_system_templates=False,
     )
@@ -181,11 +261,12 @@ def create_test_filesystem(vehicle_dir: Path, vehicle_type: str):
     return local_fs, schema
 
 
-def perform_component_inference(
+def perform_component_inference(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     local_filesystem: LocalFilesystem,
     new_vehicle_dir: str,
     vehicle_type: str,
     fc_parameters: dict,
+    metadata_source_dir: Path,
     blank_component_data: bool = False,
 ) -> tuple[bool, str]:
     """
@@ -196,12 +277,20 @@ def perform_component_inference(
         new_vehicle_dir: Path to the new vehicle directory
         vehicle_type: Vehicle type (ArduCopter, ArduPlane, Heli, Rover)
         fc_parameters: Flight controller parameters
+        metadata_source_dir: Empty template directory containing cached parameter metadata
         blank_component_data: Whether component data was blanked
 
     Returns:
         tuple: (success: bool, error_message: str)
 
     """
+    # New projects intentionally omit the cached parameter definition XML so normal project
+    # creation can refresh it.  This acceptance test runs offline, so seed the generated project
+    # from the explicitly selected empty template before reinitializing it.
+    local_filesystem.load_vehicle_components_json_data(new_vehicle_dir)
+    firmware_version = local_filesystem.get_fc_fw_version_from_vehicle_components_json()
+    _seed_offline_parameter_metadata(metadata_source_dir, new_vehicle_dir, vehicle_type, firmware_version)
+
     # Reload the local_filesystem to get the new vehicle directory's data
     local_filesystem.re_init(new_vehicle_dir, vehicle_type, blank_component_data)
 
@@ -367,7 +456,7 @@ def compounded_params_files(tmp_test_dir):
             local_fs = LocalFilesystem(
                 vehicle_dir=str(template_dir),
                 vehicle_type=vehicle_type,
-                fw_version="4.6.3",
+                fw_version="",
                 allow_editing_template_files=False,
                 save_component_to_system_templates=False,
             )
@@ -555,7 +644,7 @@ class TestTemplateImportWithComponentInference:
             local_filesystem = LocalFilesystem(
                 vehicle_dir=str(empty_template_dir),
                 vehicle_type=vehicle_type,
-                fw_version="4.6.3",
+                fw_version="",
                 allow_editing_template_files=False,
                 save_component_to_system_templates=False,
             )
@@ -591,6 +680,7 @@ class TestTemplateImportWithComponentInference:
                     new_vehicle_dir,
                     vehicle_type,
                     flight_controller.fc_parameters,
+                    empty_template_dir,
                     settings.blank_component_data,
                 )
                 assert success, error_msg
@@ -671,7 +761,7 @@ class TestTemplateImportWithComponentInference:
                 local_filesystem = LocalFilesystem(
                     vehicle_dir=str(empty_template_dir),
                     vehicle_type=vehicle_type,
-                    fw_version="4.6.3",
+                    fw_version="",
                     allow_editing_template_files=True,
                     save_component_to_system_templates=False,
                 )
@@ -703,6 +793,7 @@ class TestTemplateImportWithComponentInference:
                         new_vehicle_dir,
                         vehicle_type,
                         flight_controller.fc_parameters,
+                        empty_template_dir,
                         settings.blank_component_data,
                     )
                     if not success:

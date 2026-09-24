@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from ardupilot_methodic_configurator.annotate_params import get_xml_dir
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
 
@@ -27,6 +28,23 @@ from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
 
 class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """LocalFilesystem test class."""
+
+    def test_constructor_invalidates_mismatched_metadata_before_reinitializing(self) -> None:
+        """Opening a project invalidates stale metadata before it can be parsed."""
+        with (
+            patch.object(LocalFilesystem, "remove_cached_parameter_metadata_for_mismatched_firmware") as remove_metadata,
+            patch.object(LocalFilesystem, "re_init") as reinitialize,
+        ):
+            LocalFilesystem(
+                "/project",
+                "ArduCopter",
+                "4.7.0",
+                allow_editing_template_files=False,
+                save_component_to_system_templates=False,
+            )
+
+        remove_metadata.assert_called_once_with("/project")
+        reinitialize.assert_called_once_with("/project", "ArduCopter")
 
     def test_read_params_from_files(self) -> None:
         """Test reading parameters from files with proper filtering."""
@@ -92,6 +110,177 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
             filesystem.re_init(mock_vehicle_dir, "ArduCopter")
             assert filesystem.vehicle_dir == mock_vehicle_dir
             assert filesystem.vehicle_type == "ArduCopter"
+
+    def test_re_init_refreshes_auto_detected_firmware_version_for_each_project(self) -> None:
+        """Opening another project refreshes a firmware version that was auto-detected."""
+        filesystem = LocalFilesystem(
+            None,
+            "",
+            "",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "get_fc_fw_version_from_vehicle_components_json", side_effect=["4.7.0", "4.6.3"]),
+            patch.object(filesystem, "get_fc_fw_type_from_vehicle_components_json", return_value="ArduCopter"),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={}),
+        ):
+            filesystem.re_init("/projects/4.7", "")
+            filesystem.re_init("/projects/4.6", "")
+
+        assert filesystem.fw_version == "4.6.3"
+
+    def test_re_init_reuses_metadata_for_the_same_vehicle_firmware(self) -> None:
+        """Reinitializing a new project does not download identical metadata again."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.3",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        metadata = {
+            "TEST_PARAM": {
+                "humanName": "Test parameter",
+                "documentation": [],
+                "fields": {},
+                "values": {},
+            }
+        }
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={"01_setup.param": ParDict()}),
+            patch("ardupilot_methodic_configurator.backend_filesystem.load_default_param_file", return_value=ParDict()),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem.parse_parameter_metadata",
+                return_value=metadata,
+            ) as parse_metadata,
+        ):
+            filesystem.re_init("/projects/source", "ArduCopter")
+            filesystem.re_init("/projects/new-project", "ArduCopter")
+
+        parse_metadata.assert_called_once()
+
+    def test_firmware_mismatch_removes_cached_parameter_metadata(self) -> None:
+        """Opening a project for another FC firmware removes stale parameter metadata."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.7.0",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            filesystem._parameter_metadata_cache[("ArduCopter", "4.7.0", get_xml_dir(vehicle_dir))] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert not os_path.exists(metadata_file)
+
+        assert ("ArduCopter", "4.7.0", get_xml_dir(vehicle_dir)) not in filesystem._parameter_metadata_cache
+
+    def test_firmware_patch_mismatch_removes_cached_parameter_metadata(self) -> None:
+        """A patch-level firmware mismatch also removes stale parameter metadata."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.4",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            filesystem._parameter_metadata_cache[("ArduCopter", "4.6.4", get_xml_dir(vehicle_dir))] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert not os_path.exists(metadata_file)
+
+        assert ("ArduCopter", "4.6.4", get_xml_dir(vehicle_dir)) not in filesystem._parameter_metadata_cache
+
+    def test_firmware_patch_match_keeps_cached_parameter_metadata(self) -> None:
+        """Matching major, minor, and patch versions keep cached metadata intact."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.6.3",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        filesystem.vehicle_components_fs.data = {
+            "Components": {"Flight Controller": {"Firmware": {"Type": "ArduCopter", "Version": "4.6.3"}}}
+        }
+
+        with tempfile.TemporaryDirectory() as vehicle_dir:
+            cache_key = ("ArduCopter", "4.6.3", get_xml_dir(vehicle_dir))
+            filesystem._parameter_metadata_cache[cache_key] = {}
+            metadata_file = os_path.join(vehicle_dir, "apm.pdef.xml")
+            with open(metadata_file, "w", encoding="utf-8") as file:
+                file.write("<parameters />")
+
+            with patch.object(
+                filesystem,
+                "load_vehicle_components_json_data",
+                return_value=filesystem.vehicle_components_fs.data,
+            ):
+                assert not filesystem.remove_cached_parameter_metadata_for_mismatched_firmware(vehicle_dir)
+
+            assert os_path.exists(metadata_file)
+            assert cache_key in filesystem._parameter_metadata_cache
+
+    def test_metadata_cache_is_scoped_to_project_xml_directory(self) -> None:
+        """Projects with different local metadata do not share parsed documentation."""
+        filesystem = LocalFilesystem(
+            None,
+            "ArduCopter",
+            "4.7.0",
+            allow_editing_template_files=False,
+            save_component_to_system_templates=False,
+        )
+        metadata = {"TEST_PARAM": {"humanName": "Test", "documentation": [], "fields": {}, "values": {}}}
+
+        with (
+            patch.object(filesystem, "load_vehicle_components_json_data", return_value=True),
+            patch.object(filesystem, "rename_parameter_files"),
+            patch.object(filesystem, "read_params_from_files", return_value={"01_setup.param": ParDict()}),
+            patch("ardupilot_methodic_configurator.backend_filesystem.get_xml_dir", side_effect=["/one", "/two"]),
+            patch("ardupilot_methodic_configurator.backend_filesystem.load_default_param_file", return_value=ParDict()),
+            patch(
+                "ardupilot_methodic_configurator.backend_filesystem.parse_parameter_metadata", return_value=metadata
+            ) as parse,
+        ):
+            filesystem.re_init("/projects/one", "ArduCopter")
+            filesystem.re_init("/projects/two", "ArduCopter")
+
+        assert parse.call_count == 2
 
     def test_vehicle_configuration_files_exist(self) -> None:
         """Test checking if vehicle configuration files exist."""

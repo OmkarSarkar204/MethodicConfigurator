@@ -98,6 +98,11 @@ class FlightControllerConnectionProtocol(Protocol):
         """Get the default baud rate for serial connections."""
         ...  # pylint: disable=unnecessary-ellipsis
 
+    @property
+    def active_baudrate(self) -> int:
+        """Get the baud rate used for the current or most recent serial session."""
+        ...  # pylint: disable=unnecessary-ellipsis
+
     def discover_connections(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -123,6 +128,8 @@ class FlightControllerConnectionProtocol(Protocol):
         timeout: int,
         baudrate: int,
         log_errors: bool,
+        reconnect_progress_callback: Callable[[int, int], None] | None = None,
+        is_reconnect: bool = False,
     ) -> str: ...
 
     def get_serial_ports(self) -> list[serial.tools.list_ports_common.ListPortInfo]:
@@ -150,7 +157,9 @@ class FlightControllerConnectionProtocol(Protocol):
     @property
     def banner_text_buffer(self) -> list[str]: ...
 
-    def _detect_vehicles_from_heartbeats(self, timeout: int) -> dict[tuple[int, int], Any]: ...
+    def _detect_vehicles_from_heartbeats(
+        self, timeout: int, return_after_first_heartbeat: bool = False
+    ) -> dict[tuple[int, int], Any]: ...
 
     def _extract_firmware_type_from_banner(self, banner_msgs: list[str], os_custom_version_index: int | None) -> str: ...
 
@@ -232,6 +241,8 @@ class FlightControllerCommandsProtocol(Protocol):  # pylint: disable=too-many-pu
         param7: float,
         timeout: float,
     ) -> tuple[bool, str]: ...
+
+    def reboot_to_bootloader(self) -> tuple[bool, str]: ...
 
     def reset_all_parameters_to_default(self) -> tuple[bool, str]: ...
 

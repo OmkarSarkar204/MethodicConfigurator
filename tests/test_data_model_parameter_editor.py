@@ -17,11 +17,13 @@ import pytest
 
 from ardupilot_methodic_configurator.data_model_ardupilot_parameter import (
     ArduPilotParameter,
+    ParameterForcedOrDerivedError,
     ParameterOutOfRangeError,
     ParameterUnchangedError,
 )
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParamFileError, ParDict
 from ardupilot_methodic_configurator.data_model_parameter_editor import (
+    FcParameterCopyResult,
     InvalidParameterNameError,
     OperationNotPossibleError,
     ParameterEditor,
@@ -319,7 +321,7 @@ class TestExternalParameterUploadWorkflow:
         assert reset_happened is True
         assert reset_succeeded is True
         assert uploaded == {"BRD_BOOT_DELAY"}
-        parameter_editor._flight_controller.reset_and_reconnect.assert_called_once_with(None, None, 8)
+        parameter_editor._flight_controller.reset_and_reconnect.assert_called_once_with(None, 8)
 
 
 class TestParameterFilteringWorkflows:
@@ -1433,7 +1435,7 @@ class TestFlightControllerResetWorkflows:
         assert result is None
         parameter_editor._flight_controller.reset_and_reconnect.assert_called_once()
         args = parameter_editor._flight_controller.reset_and_reconnect.call_args[0]
-        assert args[2] == 3  # Calculated sleep time
+        assert args[1] == 3  # Calculated sleep time
 
     def test_user_can_reset_with_custom_sleep_time(self, parameter_editor) -> None:
         """
@@ -1452,7 +1454,7 @@ class TestFlightControllerResetWorkflows:
 
         # Assert: Custom time was used
         args = parameter_editor._flight_controller.reset_and_reconnect.call_args[0]
-        assert args[2] == custom_sleep_time
+        assert args[1] == custom_sleep_time
 
     def test_user_handles_reset_failure(self, parameter_editor) -> None:
         """
@@ -1483,21 +1485,18 @@ class TestFlightControllerResetWorkflows:
         parameter_editor._flight_controller.reset_all_parameters_to_default_and_reconnect.return_value = (True, "")
         parameter_editor.download_flight_controller_parameters = MagicMock(return_value=({"P1": 1.0}, ParDict()))
         show_error = MagicMock()
-        reset_progress_callback = MagicMock()
-        connection_progress_callback = MagicMock()
+        progress_callback = MagicMock()
         get_download_progress_callback = MagicMock()
 
         result = parameter_editor.reset_all_parameters_to_default(
             show_error,
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
             get_download_progress_callback,
         )
 
         assert result is True
         parameter_editor._flight_controller.reset_all_parameters_to_default_and_reconnect.assert_called_once_with(
-            reset_progress_callback,
-            connection_progress_callback,
+            progress_callback,
         )
         parameter_editor.download_flight_controller_parameters.assert_called_once_with(get_download_progress_callback)
         show_error.assert_not_called()
@@ -1582,7 +1581,7 @@ class TestFileCopyWorkflows:
 
         GIVEN: A user has relevant FC parameters to copy that exist in current_step_parameters
         WHEN: They call _update_parameters_from_fc_values
-        THEN: The in-memory parameter values should be updated and the method reports success
+        THEN: The in-memory parameter values should be updated and the result counts both updates
         """
         # Arrange (Given): Set up parameters in current_step_parameters
         param1 = ArduPilotParameter(
@@ -1606,7 +1605,7 @@ class TestFileCopyWorkflows:
         result = parameter_editor._update_parameters_from_fc_values(relevant_params)
 
         # Assert (Then): In-memory values were updated
-        assert result is True
+        assert result == FcParameterCopyResult(copied=2)
         assert param1.get_new_value() == pytest.approx(1.0)
         assert param2.get_new_value() == pytest.approx(2.0)
 
@@ -1648,7 +1647,7 @@ class TestFileCopyWorkflows:
 
         # Assert (Then):
         # 1) Method reports success
-        assert result is True
+        assert result == FcParameterCopyResult(copied=2)
 
         # 2) In-memory ArduPilotParameter values were updated to match FC values
         assert param1.get_new_value() == pytest.approx(1.0)
@@ -1665,7 +1664,7 @@ class TestFileCopyWorkflows:
 
         GIVEN: A copy operation that fails
         WHEN: User attempts to copy values
-        THEN: False should be returned
+        THEN: The result should count the failed copy
         """
         # Arrange: Set up failed copy - current_step_parameters is empty by default
         # so trying to copy PARAM1 will fail because it doesn't exist in current_step_parameters
@@ -1675,7 +1674,7 @@ class TestFileCopyWorkflows:
         result = parameter_editor._update_parameters_from_fc_values(relevant_params)
 
         # Assert: Copy failed
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
     def test_partial_update_when_some_params_fail(self, parameter_editor) -> None:
         """
@@ -1708,7 +1707,7 @@ class TestFileCopyWorkflows:
         result = parameter_editor._update_parameters_from_fc_values(relevant_params)
 
         # Assert: Partial success
-        assert result is True  # At least some succeeded
+        assert result == FcParameterCopyResult(copied=2, failed=1)
         assert param1.get_new_value() == pytest.approx(1.0)
         assert param2.get_new_value() == pytest.approx(2.0)
         # PARAM3 was logged as error but didn't prevent other updates
@@ -2757,8 +2756,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock successful reset
         with patch.object(parameter_editor, "_reset_and_reconnect_flight_controller", return_value=None):
@@ -2768,8 +2766,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow completed successfully
@@ -2792,8 +2789,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock(return_value=True)  # User confirms
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock successful reset
         with patch.object(parameter_editor, "_reset_and_reconnect_flight_controller", return_value=None):
@@ -2803,8 +2799,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=["PARAM1", "PARAM2"],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow completed successfully
@@ -2831,8 +2826,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock(return_value=False)  # User declines
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Act: Execute workflow with uncertain parameters
         result = parameter_editor.reset_and_reconnect_workflow(
@@ -2840,8 +2834,7 @@ class TestResetAndReconnectWorkflow:
             fc_reset_unsure=["PARAM1"],
             ask_confirmation=ask_confirmation_mock,
             show_error=show_error_mock,
-            reset_progress_callback=reset_progress_callback_mock,
-            connection_progress_callback=connection_progress_callback_mock,
+            progress_callback=progress_callback_mock,
         )
 
         # Assert: Workflow completed without reset
@@ -2864,8 +2857,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock failed reset with error message
         error_message = "Connection timeout during reset"
@@ -2876,8 +2868,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow failed
@@ -2897,8 +2888,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Mock reset returning error message
         error_message = "Failed to reset flight controller: Communication error"
@@ -2909,8 +2899,7 @@ class TestResetAndReconnectWorkflow:
                 fc_reset_unsure=[],
                 ask_confirmation=ask_confirmation_mock,
                 show_error=show_error_mock,
-                reset_progress_callback=reset_progress_callback_mock,
-                connection_progress_callback=connection_progress_callback_mock,
+                progress_callback=progress_callback_mock,
             )
 
         # Assert: Workflow failed
@@ -2930,8 +2919,7 @@ class TestResetAndReconnectWorkflow:
         # Arrange: Set up mock callbacks
         ask_confirmation_mock = MagicMock()
         show_error_mock = MagicMock()
-        reset_progress_callback_mock = MagicMock()
-        connection_progress_callback_mock = MagicMock()
+        progress_callback_mock = MagicMock()
 
         # Act: Execute workflow with no reset requirements
         result = parameter_editor.reset_and_reconnect_workflow(
@@ -2939,8 +2927,7 @@ class TestResetAndReconnectWorkflow:
             fc_reset_unsure=[],
             ask_confirmation=ask_confirmation_mock,
             show_error=show_error_mock,
-            reset_progress_callback=reset_progress_callback_mock,
-            connection_progress_callback=connection_progress_callback_mock,
+            progress_callback=progress_callback_mock,
         )
 
         # Assert: Workflow completed without reset
@@ -3519,6 +3506,7 @@ class TestDerivedParameterApplication:
                 [],  # duplicates_to_remove
                 [],  # renames_to_apply
                 derived_params,  # derived_params
+                set(),  # autoimported_parameters
             ),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
@@ -3564,6 +3552,7 @@ class TestDerivedParameterApplication:
                     [],  # duplicates_to_remove
                     [],  # renames_to_apply
                     derived_params,  # derived_params
+                    set(),  # autoimported_parameters
                 ),
             ),
             patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_error") as mock_log_error,
@@ -3612,6 +3601,7 @@ class TestDerivedParameterApplication:
                     [],
                     [],
                     derived_params,
+                    set(),
                 ),
             ),
             patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_error") as mock_log_error,
@@ -3651,6 +3641,7 @@ class TestDerivedParameterApplication:
                 [],
                 [],
                 derived_params,
+                set(),
             ),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
@@ -3680,7 +3671,7 @@ class TestDerivedParameterApplication:
             patch.object(
                 parameter_editor._config_step_processor,
                 "process_configuration_step",
-                return_value=({}, [], [], set(), [], ParDict()),
+                return_value=({}, [], [], set(), [], ParDict(), set()),
             ),
             patch.object(
                 parameter_editor._config_step_processor,
@@ -3693,6 +3684,38 @@ class TestDerivedParameterApplication:
         assert "NEW_FORCED" in parameter_editor.current_step_parameters
         assert parameter_editor.current_step_parameters["NEW_FORCED"] is mock_ap_param
         assert "NEW_FORCED" in parameter_editor._added_parameters
+
+    def test_autoimported_parameter_is_tracked_for_saving(self, parameter_editor) -> None:
+        """
+        Auto-imported parameters trigger the normal save workflow.
+
+        GIVEN: A configuration step adds a non-default FC parameter automatically
+        WHEN: The step is repopulated and the user confirms saving changes
+        THEN: The imported parameter is treated as an unsaved file change
+        AND: The current file is exported through the normal save path
+        """
+        parameter_editor.current_file = "test_file.param"
+        parameter_editor._last_time_asked_to_save = 0.0
+        autoimported = ArduPilotParameter("AUTO_IMPORTED", Par(2.0), fc_value=2.0)
+        with patch.object(
+            parameter_editor._config_step_processor,
+            "process_configuration_step",
+            return_value=({"AUTO_IMPORTED": autoimported}, [], [], set(), [], ParDict(), {"AUTO_IMPORTED"}),
+        ):
+            parameter_editor._repopulate_configuration_step_parameters()
+
+        assert parameter_editor._has_unsaved_changes()
+
+        with patch.object(parameter_editor, "_export_current_file") as mock_export:
+            assert (
+                parameter_editor.handle_write_changes_workflow(
+                    annotate_params_into_files=False,
+                    ask_user_confirmation=MagicMock(return_value=True),
+                )
+                is True
+            )
+
+        mock_export.assert_called_once_with(annotate_doc=False)
 
     def test_connected_editor_delegates_plugin_model_creation_to_registry(self, parameter_editor) -> None:
         """The editor supplies shared dependencies without importing concrete plugin models."""
@@ -3790,13 +3813,13 @@ class TestEditorStateInitialization:
         assert result is None
         mock_factory.create_model.assert_not_called()
 
-    def test_system_returns_false_when_fc_parameter_is_not_in_current_step(self, parameter_editor) -> None:
+    def test_system_counts_missing_fc_parameter_as_failed_copy(self, parameter_editor) -> None:
         """
-        System returns False and logs an error when the FC supplies a parameter absent from the current step.
+        System counts a missing current-step parameter as a failed copy and logs an error.
 
         GIVEN: A parameter editor whose current step contains no parameters
         WHEN: _update_parameters_from_fc_values receives a value for an unknown parameter
-        THEN: It should return False (zero parameters were successfully updated)
+        THEN: It should report one failed copy and zero successful updates
         """
         # Arrange: Empty current step
         parameter_editor.current_step_parameters = {}
@@ -3806,15 +3829,15 @@ class TestEditorStateInitialization:
             result = parameter_editor._update_parameters_from_fc_values({"MISSING_PARAM": 1.0})
 
         # Assert
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
-    def test_system_returns_false_when_parameter_update_fails_with_type_error(self, parameter_editor) -> None:
+    def test_system_counts_type_error_as_failed_copy(self, parameter_editor) -> None:
         """
-        System returns False when set_new_value raises TypeError for the supplied FC value.
+        System counts a TypeError from set_new_value as a failed copy.
 
         GIVEN: A current step parameter whose set_new_value raises TypeError
         WHEN: _update_parameters_from_fc_values supplies a value that triggers the error
-        THEN: It should return False (zero parameters were successfully updated)
+        THEN: It should report one failed copy and zero successful updates
         """
         # Arrange: Parameter that rejects the value
         mock_param = MagicMock()
@@ -3825,7 +3848,7 @@ class TestEditorStateInitialization:
         result = parameter_editor._update_parameters_from_fc_values({"P1": None})
 
         # Assert
-        assert result is False
+        assert result == FcParameterCopyResult(failed=1)
 
 
 class TestWorkflowEdgeCases:
@@ -3866,7 +3889,11 @@ class TestWorkflowEdgeCases:
         # Arrange
         with (
             patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
-            patch.object(parameter_editor, "_update_parameters_from_fc_values", return_value=True) as mock_update,
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(copied=1),
+            ) as mock_update,
         ):
             mock_ask = MagicMock(return_value=True)
 
@@ -3876,6 +3903,60 @@ class TestWorkflowEdgeCases:
         # Assert
         assert result is True
         mock_update.assert_called_once_with({"P": 1.0})
+
+    def test_user_is_told_when_fc_values_are_already_up_to_date(self, parameter_editor) -> None:
+        """
+        User is told when the confirmed FC values already match the file.
+
+        GIVEN: The user confirms copying FC values and every value is unchanged
+        WHEN: The copy workflow processes the values
+        THEN: The user is told that the parameters are already up to date
+        """
+        with (
+            patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(unchanged=1),
+            ),
+        ):
+            mock_ask = MagicMock(return_value=True)
+            mock_show_info = MagicMock()
+
+            result = parameter_editor.handle_copy_fc_values_workflow("step.param", mock_ask, mock_show_info)
+
+        assert result is True
+        mock_show_info.assert_called_once_with(
+            "Parameters already up to date",
+            "FC values already match step.param.",
+        )
+
+    def test_user_is_told_when_fc_values_fail_to_copy(self, parameter_editor) -> None:
+        """
+        User is told when confirmed FC values cannot be copied.
+
+        GIVEN: The user confirms copying FC values and the copy operation fails
+        WHEN: The copy workflow processes the values
+        THEN: The user is told that no parameters were copied
+        """
+        with (
+            patch.object(parameter_editor, "_should_copy_fc_values_to_file", return_value=(True, {"P": 1.0}, "SomeTool")),
+            patch.object(
+                parameter_editor,
+                "_update_parameters_from_fc_values",
+                return_value=FcParameterCopyResult(failed=1),
+            ),
+        ):
+            mock_ask = MagicMock(return_value=True)
+            mock_show_info = MagicMock()
+
+            result = parameter_editor.handle_copy_fc_values_workflow("step.param", mock_ask, mock_show_info)
+
+        assert result is True
+        mock_show_info.assert_called_once_with(
+            "No parameters copied",
+            "No FC values could be copied to step.param.",
+        )
 
     def test_system_skips_copy_when_user_declines(self, parameter_editor) -> None:
         """
@@ -4112,6 +4193,38 @@ class TestParameterUploadNavigation:
         mock_retry.assert_not_called()
         assert result is True
         mock_write.assert_called_once()
+
+    def test_system_logs_upload_and_verification_duration(self, parameter_editor) -> None:
+        """Log the elapsed time after uploaded parameters have been verified."""
+        parameter_editor._flight_controller.fc_parameters = {"P1": 1.0}
+
+        with (
+            patch(
+                "ardupilot_methodic_configurator.data_model_parameter_editor.perf_counter",
+                side_effect=(100.0, 100.123),
+            ),
+            patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_info") as mock_log,
+            patch.multiple(
+                parameter_editor,
+                upload_parameters_that_require_reset_workflow=MagicMock(return_value=(False, set(), True)),
+                _upload_parameters_to_fc=MagicMock(return_value=1),
+                download_flight_controller_parameters=MagicMock(),
+                _write_current_file=MagicMock(),
+                _validate_uploaded_parameters=MagicMock(return_value=[]),
+            ),
+        ):
+            result = parameter_editor.upload_selected_params_workflow(
+                {"P1": Par(1.0)},
+                ask_confirmation=MagicMock(return_value=True),
+                ask_retry_cancel=MagicMock(),
+                show_error=MagicMock(),
+            )
+
+        assert result is True
+        mock_log.assert_any_call(
+            "Uploaded and verified %(parameter_count)d parameters in %(duration_ms)d ms",
+            {"parameter_count": 1, "duration_ms": 123},
+        )
 
     def test_system_prompts_retry_when_parameter_validation_finds_mismatch(self, parameter_editor) -> None:
         """
@@ -4501,7 +4614,7 @@ class TestParameterManagementBehavior:
             patch.object(
                 parameter_editor._config_step_processor,
                 "process_configuration_step",
-                return_value=({"OLD": MagicMock()}, [], [], [], [("OLD", "NEW")], ParDict()),
+                return_value=({"OLD": MagicMock()}, [], [], [], [("OLD", "NEW")], ParDict(), set()),
             ),
             patch.object(parameter_editor._config_step_processor, "create_ardupilot_parameter", return_value=mock_new_param),
         ):
@@ -4524,12 +4637,13 @@ class TestParameterManagementBehavior:
         parameter_editor.current_file = "test.param"
         parameter_editor._local_filesystem.file_parameters = {"test.param": ParDict()}
         mock_der = MagicMock()
+        mock_der.is_manual_override = False
 
         # Act
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DER": mock_der}, [], [], [], [], ParDict({"DER": Par(2.0, "because math")})),
+            return_value=({"DER": mock_der}, [], [], [], [], ParDict({"DER": Par(2.0, "because math")}), set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6100,6 +6214,38 @@ class TestUnsavedComponentChangesPrompt:
         mock_revert.assert_called_once()
 
 
+class TestManualOverridePersistenceAcrossNavigation:  # pylint: disable=too-few-public-methods
+    """Protect persisted manual override values during configuration-step rebuilds."""
+
+    def test_repopulate_does_not_reapply_derived_value_to_manual_override(self, parameter_editor: ParameterEditor) -> None:
+        """A saved derived override must win over the newly computed derived value."""
+        parameter_editor.current_file = "test_file.param"
+        manual_param = ArduPilotParameter(
+            "PARAM1",
+            Par(42.0, "@manual_override user value"),
+            derived_par=Par(99.0, "derived by configuration"),
+        )
+        derived_params = ParDict({"PARAM1": Par(99.0, "derived by configuration")})
+        parameter_editor._config_step_processor.process_configuration_step = MagicMock(
+            return_value=(
+                {"PARAM1": manual_param},
+                [],
+                [],
+                set(),
+                [],
+                derived_params,
+                set(),
+            )
+        )
+
+        parameter_editor._repopulate_configuration_step_parameters()
+
+        reloaded_param = parameter_editor.current_step_parameters["PARAM1"]
+        assert reloaded_param.is_manual_override
+        assert reloaded_param.get_new_value() == 42.0
+        assert reloaded_param.change_reason == "user value"
+
+
 class TestCopyFlightControllerValuesEdgeCases:
     """Test how out-of-range and unchanged flight controller values are copied into a file."""
 
@@ -6117,7 +6263,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         param.set_new_value.side_effect = ParameterOutOfRangeError("out of range")
         parameter_editor.current_step_parameters = {"PARAM1": param}
 
-        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 999.0}) is True
+        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 999.0}) == FcParameterCopyResult(copied=1)
         param.set_new_value.assert_called_once_with("999.0", ignore_out_of_range=True)
 
     def test_user_sees_no_change_when_the_flight_controller_values_already_match(
@@ -6134,7 +6280,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         param.set_new_value.side_effect = ParameterUnchangedError("unchanged")
         parameter_editor.current_step_parameters = {"PARAM1": param}
 
-        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 1.0}) is False
+        assert parameter_editor._update_parameters_from_fc_values({"PARAM1": 1.0}) == FcParameterCopyResult(unchanged=1)
 
     def test_system_skips_a_flight_controller_value_that_cannot_be_converted(self, parameter_editor: ParameterEditor) -> None:
         """
@@ -6149,8 +6295,37 @@ class TestCopyFlightControllerValuesEdgeCases:
         good = ArduPilotParameter("GOOD", Par(1.0))
         parameter_editor.current_step_parameters = {"BAD": bad, "GOOD": good}
 
-        assert parameter_editor._update_parameters_from_fc_values({"BAD": 1.0, "GOOD": 2.0}) is True
+        with patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_exception") as mock_exception:
+            result = parameter_editor._update_parameters_from_fc_values({"BAD": 1.0, "GOOD": 2.0})
+
         assert good.get_new_value() == 2.0
+        assert result == FcParameterCopyResult(copied=1, failed=1)
+        mock_exception.assert_called_once_with("Failed to update in-memory value for BAD after FC copy")
+
+    def test_system_warns_without_a_traceback_when_a_parameter_is_forced_or_derived(
+        self, parameter_editor: ParameterEditor
+    ) -> None:
+        """
+        A forced or derived parameter cannot be replaced by a value from the flight controller.
+
+        GIVEN: A parameter that rejects an FC value because it is forced or derived
+        WHEN: The FC value is copied into the current file
+        THEN: Its error message is logged as a warning without an exception traceback
+        """
+        param = MagicMock()
+        error_message = "This parameter is forced or derived and cannot be changed."
+        error = ParameterForcedOrDerivedError(error_message)
+        param.set_new_value.side_effect = error
+        parameter_editor.current_step_parameters = {"FORCED": param}
+
+        with patch("ardupilot_methodic_configurator.data_model_parameter_editor.logging_warning") as mock_warning:
+            result = parameter_editor._update_parameters_from_fc_values({"FORCED": 1.0})
+
+        assert result == FcParameterCopyResult(failed=1)
+        mock_warning.assert_called_once_with(
+            "Parameter FORCED could not be updated because it is forced or derived: "
+            "This parameter is forced or derived and cannot be changed."
+        )
 
     def test_system_skips_a_flight_controller_value_absent_from_the_current_step(
         self, parameter_editor: ParameterEditor
@@ -6164,7 +6339,7 @@ class TestCopyFlightControllerValuesEdgeCases:
         """
         parameter_editor.current_step_parameters = {}
 
-        assert parameter_editor._update_parameters_from_fc_values({"ABSENT": 1.0}) is False
+        assert parameter_editor._update_parameters_from_fc_values({"ABSENT": 1.0}) == FcParameterCopyResult(failed=1)
 
 
 class TestFlightControllerParameterDiffExport:
@@ -6299,7 +6474,7 @@ class TestConfigurationStepParameterRepopulation:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({}, [], [], [], [], {}),
+            return_value=({}, [], [], [], [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6324,7 +6499,7 @@ class TestConfigurationStepParameterRepopulation:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"OLD_PARAM": MagicMock()}, [], [], [], [], {}),
+            return_value=({"OLD_PARAM": MagicMock()}, [], [], [], [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6746,7 +6921,7 @@ class TestDuplicateParameterRemoval:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}),
+            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 
@@ -6772,7 +6947,7 @@ class TestDuplicateParameterRemoval:
         with patch.object(
             parameter_editor._config_step_processor,
             "process_configuration_step",
-            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}),
+            return_value=({"DUP_PARAM": MagicMock()}, [], [], {"DUP_PARAM"}, [], {}, set()),
         ):
             parameter_editor._repopulate_configuration_step_parameters()
 

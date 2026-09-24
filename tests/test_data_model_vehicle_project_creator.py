@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
+from ardupilot_methodic_configurator.backend_filesystem_program_settings import ProgramSettings
 from ardupilot_methodic_configurator.data_model_par_dict import ParDict
 from ardupilot_methodic_configurator.data_model_vehicle_project_creator import (
     NewVehicleProjectSetting,
@@ -1177,13 +1178,14 @@ class TestBinLogImportHelpers:
         THEN: Only the filename without extension or directory is returned
         """
         # Arrange
-        bin_file = "/logs/2024-04-24/my_flight.bin"
+        bin_file = "/logs/2024-04-24/my flight log.bin"
 
         # Act
         result = VehicleProjectCreator.vehicle_name_from_bin_log(bin_file)
 
         # Assert
-        assert result == "my_flight"
+        assert result == "my flight log"
+        assert ProgramSettings.valid_directory_name(VehicleProjectCreator.vehicle_name_from_bin_log(bin_file)) is True
 
     def test_next_import_filename_starts_at_one_when_no_param_files_exist(self, tmp_path) -> None:
         """
@@ -1237,6 +1239,23 @@ class TestBinLogImportHelpers:
 
         # Assert: txt file must not have inflated the counter
         assert result == "04_imported_bin_log_parameters.param"
+
+    def test_next_import_filename_labels_the_parameter_source(self, tmp_path) -> None:
+        """
+        next_import_filename labels an import according to its source.
+
+        GIVEN: A newly created vehicle directory
+        WHEN: A flight-controller import filename is requested
+        THEN: The filename identifies the flight-controller source
+        """
+        # Arrange: use an empty vehicle directory
+        vehicle_dir = str(tmp_path)
+
+        # Act: request a filename for live flight-controller parameters
+        result = VehicleProjectCreator.next_import_filename(vehicle_dir, source="flight_controller")
+
+        # Assert: the source is visible in the generated filename
+        assert result == "01_imported_flight_controller_parameters.param"
 
     def test_next_import_filename_converts_os_error_to_creation_error(self, tmp_path, monkeypatch) -> None:
         """
