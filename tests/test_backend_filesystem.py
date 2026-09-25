@@ -23,7 +23,7 @@ from ardupilot_methodic_configurator.annotate_params import get_xml_dir
 from ardupilot_methodic_configurator.backend_filesystem import LocalFilesystem
 from ardupilot_methodic_configurator.data_model_par_dict import Par, ParDict
 
-# pylint: disable=too-many-lines, too-many-arguments, too-many-positional-arguments, protected-access
+# pylint: disable=too-many-lines, protected-access
 
 
 class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public-methods
@@ -1096,6 +1096,18 @@ class TestLocalFilesystem(unittest.TestCase):  # pylint: disable=too-many-public
         assert args["vehicle_type"] == "ArduCopter"
         assert args["n"] == 1
         assert args["allow_editing_template_files"] is True
+
+    def test_bin_log_help_explains_the_explicit_vehicle_directory_destination(self) -> None:
+        """The CLI help documents how --vehicle-dir changes a .bin-log project's destination."""
+        parser = ArgumentParser()
+        LocalFilesystem.add_argparse_arguments(parser)
+
+        help_text = " ".join(parser.format_help().split())
+
+        assert "an explicitly supplied value is the complete destination project directory" in help_text
+        assert "explicitly supplied --vehicle-dir" in help_text
+        assert "By default, the project is created in the default vehicles directory" in help_text
+        assert "validates the vehicle type reported by the log" in help_text
 
     def test_annotate_intermediate_comments_to_param_dict(self) -> None:
         lfs = LocalFilesystem(
