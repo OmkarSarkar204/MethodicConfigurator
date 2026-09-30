@@ -45,7 +45,11 @@ from ardupilot_methodic_configurator.backend_flightcontroller_connection import 
     SUPPORTED_BAUDRATES,
     FlightControllerConnection,
 )
-from ardupilot_methodic_configurator.backend_flightcontroller_files import FlightControllerFiles
+from ardupilot_methodic_configurator.backend_flightcontroller_files import (
+    FlightControllerFiles,
+    FlightControllerLogFile,
+    LastLogDownloadResult,
+)
 from ardupilot_methodic_configurator.backend_flightcontroller_params import FlightControllerParams
 from ardupilot_methodic_configurator.backend_flightcontroller_protocols import (
     FlightControllerCommandsProtocol,
@@ -671,10 +675,15 @@ class FlightController:  # pylint: disable=too-many-public-methods,too-many-inst
         progress_callback: Callable[[int, int], None] | None = None,
         parameter_values_filename: Path | None = None,
         parameter_defaults_filename: Path | None = None,
+        *,
+        response_timeout: float | None = None,
     ) -> tuple[dict[str, float], ParDict]:
         """Download all parameters from flight controller - delegates to params manager."""
         params, defaults = self._params_manager.download_params(
-            progress_callback, parameter_values_filename, parameter_defaults_filename
+            progress_callback,
+            parameter_values_filename,
+            parameter_defaults_filename,
+            response_timeout=response_timeout,
         )
         # params_manager updates its fc_parameters internally, which we access via property
         return params, defaults
@@ -738,8 +747,16 @@ class FlightController:  # pylint: disable=too-many-public-methods,too-many-inst
         return self._commands_manager.start_accel_calibration_simple()
 
     def start_accel_calibration_level(self) -> tuple[bool, str]:
-        """Level-trim the accelerometers (sets AHRS_TRIM_*) - delegates to commands manager."""
+        """Start level-trim calibration (sets AHRS_TRIM_*) without waiting for its ACK."""
         return self._commands_manager.start_accel_calibration_level()
+
+    def poll_accel_calibration_level(self) -> tuple[bool, str] | None:
+        """Poll level-trim calibration; return None while the FC is still working."""
+        return self._commands_manager.poll_accel_calibration_level()
+
+    def abort_accel_calibration_level(self) -> None:
+        """Release a level calibration exchange abandoned by the active view."""
+        self._commands_manager.abort_level_calibration()
 
     def send_accel_calibration_full_start(self) -> tuple[bool, str]:
         """Send the start command for interactive 6-position calibration - delegates to commands manager."""
@@ -752,10 +769,6 @@ class FlightController:  # pylint: disable=too-many-public-methods,too-many-inst
     def confirm_accel_vehicle_pos(self, position: int) -> tuple[bool, str]:
         """Confirm calibration position to the FC - delegates to commands manager."""
         return self._commands_manager.confirm_accel_vehicle_pos(position)
-
-    def cancel_accel_calibration(self) -> tuple[bool, str]:
-        """Cancel any ongoing accelerometer calibration - delegates to commands manager."""
-        return self._commands_manager.cancel_accel_calibration()
 
     def poll_scaled_imu(self) -> tuple[float, float, float] | None:
         """Read the latest SCALED_IMU reading - delegates to commands manager."""
@@ -795,9 +808,41 @@ class FlightController:  # pylint: disable=too-many-public-methods,too-many-inst
 
     def download_last_flight_log(
         self, local_filename: str, progress_callback: Callable[[int, int], None] | None = None
-    ) -> bool:
-        """Download the last flight log from the flight controller - delegates to files manager."""
+    ) -> LastLogDownloadResult:
+        """Download the last log and retain the reason for failure."""
         return self._files_manager.download_last_flight_log(local_filename, progress_callback)
+
+    def list_remote_files(
+        self,
+        remote_directory: str = "/APM/LOGS/",
+    ) -> list[FlightControllerLogFile] | None:
+        """List files and directories in a remote directory - delegates to files manager."""
+        return self._files_manager.list_remote_files(remote_directory)
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_filename: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Download one remote file - delegates to files manager."""
+        return self._files_manager.download_remote_file(remote_path, local_filename, progress_callback)
+
+    def verify_remote_file(self, remote_path: str, local_filename: str) -> bool | None:
+        """Compare a transferred local file with the remote file CRC."""
+        return self._files_manager.verify_remote_file(remote_path, local_filename)
+
+    def make_remote_directory(self, remote_directory: str) -> bool:
+        """Create a remote directory - delegates to files manager."""
+        return self._files_manager.make_remote_directory(remote_directory)
+
+    def delete_remote_path(self, remote_path: str, is_directory: bool = False) -> bool:
+        """Delete a remote file or directory - delegates to files manager."""
+        return self._files_manager.delete_remote_path(remote_path, is_directory)
+
+    def rename_remote_path(self, remote_path: str, new_remote_path: str) -> bool:
+        """Rename a remote file or directory - delegates to files manager."""
+        return self._files_manager.rename_remote_path(remote_path, new_remote_path)
 
     # Static methods and properties
 

@@ -32,7 +32,6 @@ from ardupilot_methodic_configurator.log_analysis.data_model_log_data import Log
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
 # pylint: disable=too-many-lines, redefined-outer-name, protected-access
 
@@ -149,7 +148,10 @@ def parameter_editor() -> MagicMock:
     manager.handle_copy_fc_values_workflow = MagicMock(return_value="close")
     manager.open_documentation_in_browser = MagicMock()
 
-    def _download_fc_parameters(get_progress_callback: Callable | None = None) -> None:
+    def _download_fc_parameters(
+        get_progress_callback: Callable | None = None, *, response_timeout: float | None = None
+    ) -> None:
+        assert response_timeout is None
         if get_progress_callback is not None:
             callback = get_progress_callback()
             if callback is not None:
@@ -157,7 +159,6 @@ def parameter_editor() -> MagicMock:
 
     manager.download_flight_controller_parameters = MagicMock(side_effect=_download_fc_parameters)
     manager.upload_selected_params_workflow = MagicMock()
-    manager.download_last_flight_log_workflow = MagicMock()
     manager.write_summary_files_workflow = MagicMock()
     manager.last_upload_progress_callback = None
     manager.get_log_analysis_context_inputs = MagicMock(
@@ -1957,7 +1958,7 @@ class TestProgressIndicators:
 
         editor.download_flight_controller_parameters(redownload=False)
 
-        parameter_editor.download_flight_controller_parameters.assert_called_once()
+        parameter_editor.download_flight_controller_parameters.assert_called_once_with(ANY, response_timeout=None)
         progress_instance.destroy.assert_called_once()
         editor.on_param_file_combobox_change.assert_called_once_with(None, forced=True)
 
@@ -1978,7 +1979,7 @@ class TestProgressIndicators:
 
         editor.download_flight_controller_parameters(redownload=True)
 
-        parameter_editor.download_flight_controller_parameters.assert_called_once()
+        parameter_editor.download_flight_controller_parameters.assert_called_once_with(ANY, response_timeout=None)
         editor.on_param_file_combobox_change.assert_not_called()
         progress_instance.destroy.assert_called_once()
 
@@ -2333,36 +2334,11 @@ class TestParameterUploads:
 
 
 class TestFlightLogDownloads:  # pylint: disable=too-few-public-methods
-    """Verify downloading flight logs through the GUI helper."""
+    """Keep one file-browser entry point for flight-log downloads."""
 
-    def test_user_downloads_last_flight_log_with_progress(
-        self,
-        editor_factory,
-        parameter_editor: MagicMock,
-        tmp_path: Path,
-    ) -> None:
-        """
-        User downloads the last flight log while monitoring progress.
-
-        GIVEN: The workflow accepts callbacks for progress and saving the file
-        WHEN: The user starts the download
-        THEN: A progress window is shown and destroyed after completion
-        """
-        editor = editor_factory()
-
-        progress_instance = MagicMock()
-        progress_instance.update_progress_bar = MagicMock()
-        editor.ui.create_progress_window = MagicMock(return_value=progress_instance)
-        log_file = tmp_path / "log.bin"
-        editor.ui.asksaveasfilename = MagicMock(return_value=str(log_file))
-
-        editor.on_download_last_flight_log_click()
-
-        parameter_editor.download_last_flight_log_workflow.assert_called_once()
-        workflow_kwargs = parameter_editor.download_last_flight_log_workflow.call_args.kwargs
-        assert workflow_kwargs["ask_saveas_filename"]() == str(log_file)
-        assert workflow_kwargs["progress_callback"] is progress_instance.update_progress_bar
-        progress_instance.destroy.assert_called_once()
+    def test_old_synchronous_log_handler_is_retired(self) -> None:
+        """The legacy handler must not compete with the browser's async action."""
+        assert not hasattr(ParameterEditorWindow, "on_download_last_flight_log_click")
 
 
 # ============================== PERSISTENCE AND EXIT ==============================

@@ -15,10 +15,12 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import logging
 import socket
 import struct
+import tempfile
 import unittest
 
 # from unittest.mock import patch
 from io import BytesIO, StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,6 +36,7 @@ from ardupilot_methodic_configurator.backend_mavftp import (
     OP_BurstReadFile,
     OP_ListDirectory,
     OP_Nack,
+    OP_OpenFileRO,
     OP_ReadFile,
     OP_ResetSessions,
     OP_TerminateSession,
@@ -271,6 +274,40 @@ class TestMAVFTPPayloadDecoding(unittest.TestCase):  # pylint: disable=too-many-
             result = self.mav_ftp.process_ftp_reply("ResetSessions", timeout=1)
 
         assert result.error_code == FtpError.Success
+
+    def test_one_reply_request_without_initial_retries_waits_for_idle_deadline(self) -> None:
+        """Disabled retransmission waits for idle detection before reporting timeout."""
+        self.mav_ftp.last_op = FTP_OP(
+            seq=0,
+            session=self.mav_ftp.session,
+            opcode=OP_ListDirectory,
+            size=0,
+            req_opcode=0,
+            burst_complete=0,
+            offset=0,
+            payload=None,
+        )
+        self.mav_ftp.last_op_time = 0.0
+        self.mav_ftp.request_cancelled = False
+        self.mav_ftp.ftp_settings.initial_retries = 0
+
+        # Replace the backend's module binding rather than time.time itself.
+        # Patching the shared time module also changes logging's clock, so
+        # creating the timeout log record would consume another side effect.
+        backend_clock = SimpleNamespace(time=Mock(side_effect=[2.0, 3.8]))
+        with (
+            patch("ardupilot_methodic_configurator.backend_mavftp.time", backend_clock),
+            patch.object(self.mav_ftp, "_MAVFTP__terminate_session") as terminate,
+        ):
+            early_idle = self.mav_ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
+            assert early_idle is False
+            assert self.mav_ftp.terminal_timeout is False
+
+            idle = self.mav_ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
+
+        assert idle is False
+        assert self.mav_ftp.terminal_timeout is True
+        terminate.assert_called_once()
 
     def test_read_renews_deadline_when_idle_flush_accepts_delayed_reply(self) -> None:
         """A delayed reply accepted by idle_task must extend read's deadline."""
@@ -579,6 +616,18 @@ class TestMAVFTPPayloadDecoding(unittest.TestCase):  # pylint: disable=too-many-
         terminate.assert_called_once()
         assert "Wrote 4/4 bytes to destination.bin" in self.log_stream.getvalue()
 
+    def test_directory_fsync_is_skipped_on_windows(self) -> None:
+        """Windows cannot fsync a directory after publishing a staged file."""
+        with (
+            patch("ardupilot_methodic_configurator.backend_mavftp.os.name", "nt"),
+            patch("ardupilot_methodic_configurator.backend_mavftp.os.open") as open_file,
+            patch("ardupilot_methodic_configurator.backend_mavftp.os.fsync") as fsync,
+        ):
+            self.mav_ftp._MAVFTP__fsync_directory("C:\\downloads")  # pylint: disable=protected-access
+
+        open_file.assert_not_called()
+        fsync.assert_not_called()
+
     def test_console_idle_detection_default_matches_the_established_cli_value(self) -> None:
         """The standalone MAVFTP console uses the current MAVFTP idle timeout."""
         args = create_argument_parser().parse_args(["get", "remote.bin"])
@@ -594,6 +643,152 @@ class TestMAVFTPPayloadDecoding(unittest.TestCase):  # pylint: disable=too-many-
 
         assert result.error_code == FtpError.Success
         assert self.mav_ftp.get_result is None
+
+    def test_sysfs_download_treats_placeholder_size_as_an_upper_bound(self) -> None:
+        """Generated @SYS files finish at EOF instead of their placeholder stat size."""
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "uarts.txt"
+            self._finish_short_download("/@SYS/uarts.txt", destination, 100000)
+            assert destination.read_bytes() == b"data"
+            assert self.mav_ftp.callback_failure is None
+
+    def test_sysfs_exact_size_files_reject_short_downloads(self) -> None:
+        """Storage and crash dumps retain their authoritative OpenFileRO sizes."""
+        for remote in ("/@SYS/storage.bin", "/@SYS/crash_dump.bin"):
+            with self.subTest(remote=remote), tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "original.bin"
+                destination.write_bytes(b"original")
+                self._finish_short_download(remote, destination, 16384)
+                assert destination.read_bytes() == b"original"
+                assert self.mav_ftp.callback_failure.error_code == FtpError.InvalidDataSize
+
+    def _finish_short_download(self, remote: str, destination: Path, advertised_size: int) -> None:
+        """Drive the real open reply and EOF publication path with a short payload."""
+        with patch.object(self.mav_ftp, "_MAVFTP__send"):
+            result = self.mav_ftp.cmd_get([remote, str(destination)])
+            assert result.error_code == FtpError.Success
+            reply = FTP_OP(
+                seq=self.mav_ftp.seq,
+                session=self.mav_ftp.session,
+                opcode=OP_Ack,
+                size=4,
+                req_opcode=0,
+                burst_complete=0,
+                offset=0,
+                payload=bytearray(struct.pack("<I", advertised_size)),
+            )
+            self.mav_ftp._MAVFTP__handle_open_ro_reply(reply, None)  # pylint: disable=protected-access
+            self.mav_ftp.fh.write(b"data")
+            self.mav_ftp.read_total = 4
+            self.mav_ftp.reached_eof = True
+            with patch.object(
+                self.mav_ftp, "process_ftp_reply", return_value=MAVFTPReturn("TerminateSession", FtpError.Success)
+            ):
+                assert self.mav_ftp._MAVFTP__check_read_finished()  # pylint: disable=protected-access
+
+    def test_cancel_releases_staging_when_termination_send_fails(self) -> None:
+        """A lost link cannot leave an open staging handle behind after cancel."""
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory) / "staging.bin"
+            self.mav_ftp.fh = staging.open("wb+")
+            self.mav_ftp.fh_owned = True
+            self.mav_ftp.temp_filename = str(staging)
+            with patch.object(self.mav_ftp, "_MAVFTP__send", side_effect=OSError("disconnected")):
+                result = self.mav_ftp.cmd_cancel()
+            assert result.error_code == FtpError.RemoteReplyTimeout
+            assert self.mav_ftp.fh is None
+            assert not staging.exists()
+
+    def test_cancel_releases_staging_when_delayed_termination_send_fails(self) -> None:
+        """A queued termination send failure must still finish local cleanup."""
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory) / "staging.bin"
+            self.mav_ftp.fh = staging.open("wb+")
+            self.mav_ftp.fh_owned = True
+            self.mav_ftp.temp_filename = str(staging)
+            old_session = self.mav_ftp.session
+            self.mav_ftp.ftp_settings.pkt_lag_tx = 1.0
+            with (
+                patch("ardupilot_methodic_configurator.backend_mavftp.time.monotonic", side_effect=[0.0, 1.0]),
+                patch.object(self.mock_master, "recv_match", return_value=None),
+                patch.object(self.mav_ftp, "_MAVFTP__transmit_payload", side_effect=OSError("link lost")),
+            ):
+                result = self.mav_ftp.cmd_cancel()
+
+            assert result.error_code == FtpError.RemoteReplyTimeout
+            assert self.mav_ftp.fh is None
+            assert not staging.exists()
+            assert self.mav_ftp.pending_terminate_seq is None
+            assert not self.mav_ftp.tx_delay_queue
+            assert self.mav_ftp.session == (old_session + 1) % 256
+
+    def test_termination_retry_send_failure_still_advances_session(self) -> None:
+        """A failed retry cannot turn a completed download into an exception."""
+        old_session = self.mav_ftp.session
+        timeout = MAVFTPReturn("TerminateSession", FtpError.RemoteReplyTimeout)
+        with (
+            patch.object(self.mav_ftp, "_MAVFTP__send", side_effect=[None, OSError("link lost")]),
+            patch.object(self.mav_ftp, "process_ftp_reply", return_value=timeout),
+        ):
+            result = self.mav_ftp.cmd_cancel()
+        assert result.error_code == FtpError.RemoteReplyTimeout
+        assert self.mav_ftp.pending_terminate_seq is None
+        assert self.mav_ftp.session == (old_session + 1) % 256
+
+    def test_published_download_survives_termination_retry_send_failure(self) -> None:
+        """A lost termination retry cannot report a published file as failed."""
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "download.bin"
+            old_session = self.mav_ftp.session
+            with patch.object(self.mav_ftp, "_MAVFTP__send"):
+                assert self.mav_ftp.cmd_get(["remote.bin", str(destination)]).error_code == FtpError.Success
+                reply = FTP_OP(self.mav_ftp.seq, self.mav_ftp.session, OP_Ack, 4, 0, 0, 0, bytearray(struct.pack("<I", 4)))
+                self.mav_ftp._MAVFTP__handle_open_ro_reply(reply, None)  # pylint: disable=protected-access
+            self.mav_ftp.fh.write(b"data")
+            self.mav_ftp.read_total = 4
+            self.mav_ftp.reached_eof = True
+            timeout = MAVFTPReturn("TerminateSession", FtpError.RemoteReplyTimeout)
+            with (
+                patch.object(self.mav_ftp, "_MAVFTP__send", side_effect=[None, OSError("link lost")]),
+                patch.object(self.mav_ftp, "process_ftp_reply", return_value=timeout),
+            ):
+                assert self.mav_ftp._MAVFTP__check_read_finished()  # pylint: disable=protected-access
+            assert destination.read_bytes() == b"data"
+            assert self.mav_ftp.read_complete
+            assert self.mav_ftp.session == (old_session + 1) % 256
+
+    def test_failed_cancel_does_not_retry_old_open(self) -> None:
+        """Cancel suppresses retransmission even when termination cannot be sent."""
+        self.mav_ftp.last_op = FTP_OP(1, 0, OP_OpenFileRO, 0, 0, 0, 0, None)
+        self.mav_ftp.op_start = 1.0
+        send_error = OSError("link lost")
+
+        def failed_send(_operation: FTP_OP) -> None:
+            self.mav_ftp.request_cancelled = False
+            raise send_error
+
+        with patch.object(self.mav_ftp, "_MAVFTP__send", side_effect=failed_send):
+            self.mav_ftp.cmd_cancel()
+        assert self.mav_ftp.request_cancelled
+        assert self.mav_ftp.op_start is None
+        with patch.object(self.mav_ftp, "_MAVFTP__send") as send:
+            self.mav_ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
+        send.assert_not_called()
+
+    def test_failed_download_progress_callback_is_logged_once_and_data_continues(self) -> None:
+        """A broken UI callback does not abort a good download or flood the log."""
+        self.mav_ftp.fh = BytesIO()
+        self.mav_ftp.remote_file_size = 8
+        progress = Mock(side_effect=RuntimeError("UI closed"))
+        self.mav_ftp.callback_progress = progress
+        with patch.object(self.mav_ftp, "_MAVFTP__terminate_session") as terminate:
+            for offset in (0, 4):
+                packet = FTP_OP(1, 0, OP_Ack, 4, OP_ReadFile, 0, offset, b"data")
+                assert self.mav_ftp._MAVFTP__write_payload(packet)  # pylint: disable=protected-access
+        assert self.mav_ftp.fh.getvalue() == b"datadata"
+        progress.assert_called_once()
+        terminate.assert_not_called()
+        assert self.log_stream.getvalue().count("download progress callback failed") == 1
 
     def test_websocket_batch_uses_link_write_for_websocket_framing(self) -> None:
         """Batched packets use write() for both pymavlink WebSocket link classes."""
@@ -1007,6 +1202,27 @@ class TestMAVFTPWritePathCrashes(unittest.TestCase):
             self.mav_ftp._MAVFTP__handle_write_reply(op, None)  # pylint: disable=protected-access
         except ZeroDivisionError as e:
             self.fail(f"__handle_write_reply raised ZeroDivisionError for empty file: {e}")
+
+    def test_unknown_remote_size_still_reports_download_progress(self) -> None:
+        """Downloads without a reported size still notify callbacks so they can be cancelled."""
+        self.mav_ftp.fh = BytesIO()
+        self.mav_ftp.remote_file_size = 0
+        progress_callback = Mock()
+        operation = FTP_OP(
+            seq=1,
+            session=1,
+            opcode=OP_Ack,
+            size=4,
+            req_opcode=OP_ReadFile,
+            burst_complete=0,
+            offset=0,
+            payload=b"data",
+        )
+        self.mav_ftp.callback_progress = progress_callback
+
+        self.mav_ftp._MAVFTP__write_payload(operation)  # pylint: disable=protected-access
+
+        progress_callback.assert_called_once_with(0.0)
 
     def test_send_more_writes_none_guard_at_line_886(self) -> None:
         """Bug fix: Missing None guard before len(write_list) at line 886."""
